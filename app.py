@@ -1,189 +1,120 @@
 """
-Deepfake Detector -- Streamlit app.
+Deepfake Detector -- Flask + HTML/CSS/JS frontend.
+
+This is an alternative to app.py (the Streamlit version) with a fully
+custom, polished interface. It uses the exact same model, training and
+feedback-loop code (model.py, train.py, feedback_manager.py, config.py) --
+only the presentation layer differs.
 
 Run with:
-    streamlit run app.py
-
-See README.md for setup, training data sources, and how the continuous
-learning / feedback loop works.
+    python app_flask.py
+then open http://127.0.0.1:5000
 """
-import streamlit as st
+import os
+import time
+import uuid
+
+from flask import Flask, jsonify, render_template, request
 from PIL import Image
 
 import config
 import feedback_manager
 from model import DeepfakeDetector
 
-st.set_page_config(page_title="Deepfake Detector", page_icon="🕵️", layout="centered")
+app = Flask(__name__)
+detector = DeepfakeDetector()
+
+TMP_DIR = os.path.join(config.DATA_DIR, "_tmp_uploads")
+os.makedirs(TMP_DIR, exist_ok=True)
+TMP_MAX_AGE_SECONDS = 2 * 60 * 60  # 2 hours
 
 
-@st.cache_resource
-def load_detector():
-    return DeepfakeDetector()
+def _cleanup_tmp():
+    """Best-effort removal of stale temp uploads (e.g. abandoned sessions)."""
+    now = time.time()
+    try:
+        for name in os.listdir(TMP_DIR):
+            path = os.path.join(TMP_DIR, name)
+            if os.path.isfile(path) and now - os.path.getmtime(path) > TMP_MAX_AGE_SECONDS:
+                os.remove(path)
+    except OSError:
+        pass
 
 
-detector = load_detector()
+@app.route("/")
+def index():
+    return render_template("index.html", retrain_threshold=config.RETRAIN_THRESHOLD)
 
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-st.title("🕵️ Deepfake & Fraud Image Detector")
-st.caption(
-    "Upload an image to check whether it looks real or AI-manipulated, "
-    "with a confidence score. Built to help flag misinformation and "
-    "fraudulent media before it spreads."
-)
 
-if not st.session_state.get("_warned_no_checkpoint"):
-    import os
-    if not os.path.exists(config.CURRENT_MODEL_PATH):
-        st.warning(
-            "⚠️ No trained checkpoint found yet. This demo is currently running on a "
-            "generic ImageNet backbone that has **not** been trained to tell real "
-            "faces from deepfakes -- predictions below are not meaningful until you "
-            "run `python train.py` on a labeled dataset. See README.md.",
-            icon="⚠️",
-        )
-    st.session_state["_warned_no_checkpoint"] = True
+@app.route("/api/predict", methods=["POST"])
+def api_predict():
+    _cleanup_tmp()
 
-# ---------------------------------------------------------------------------
-# Sidebar: model & feedback status
-# ---------------------------------------------------------------------------
-with st.sidebar:
-    st.header("📊 Model status")
-    stats = feedback_manager.get_stats()
+    if "image" not in request.files:
+        return jsonify({"error": "No image uploaded."}), 400
 
-    st.metric("Feedback samples collected", stats["total_feedback"])
-    st.metric("Corrections received", stats["corrections_received"])
+    file = request.files["image"]
+    try:
+        image = Image.open(file.stream)
+        image.load()
+    except Exception:
+        return jsonify({"error": "That file couldn't be read as an image."}), 400
 
-    progress = min(stats["pending_feedback"] / config.RETRAIN_THRESHOLD, 1.0)
-    st.progress(progress, text=(
-        f"{stats['pending_feedback']} / {config.RETRAIN_THRESHOLD} new samples "
-        f"toward next retrain"
-    ))
+    result = detector.predict(image)
 
-    if stats["last_retrain"]:
-        ts, accepted, new_acc = stats["last_retrain"]
-        status = "✅ accepted" if accepted else "❌ rejected (safety check failed)"
-        acc_str = f"{new_acc:.1%}" if new_acc is not None else "n/a"
-        st.caption(f"Last retrain: {ts[:19]} UTC -- {status} (val acc: {acc_str})")
-    else:
-        st.caption("No retraining has happened yet.")
+    # Stash the image on disk under a token so /api/feedback can retrieve the
+    # exact same bytes later without the browser having to re-upload it.
+    token = uuid.uuid4().hex
+    tmp_path = os.path.join(TMP_DIR, f"{token}.jpg")
+    image.convert("RGB").save(tmp_path, "JPEG", quality=95)
 
-    st.divider()
-    if st.button("🔁 Retrain now (force)", use_container_width=True,
-                  help="Runs fine-tuning immediately on all pending feedback, "
-                       "even if the threshold hasn't been reached."):
-        with st.spinner("Fine-tuning on pending feedback and validating..."):
-            result = feedback_manager.run_retrain(force=True)
-        if result.get("skipped"):
-            st.info(result.get("reason", "Nothing to retrain on yet."))
-        elif result.get("accepted"):
+    result["token"] = token
+    result["low_confidence"] = result["confidence"] < config.LOW_CONFIDENCE_THRESHOLD
+    return jsonify(result)
+
+
+@app.route("/api/feedback", methods=["POST"])
+def api_feedback():
+    payload = request.get_json(silent=True) or {}
+    token = payload.get("token")
+    predicted_label = payload.get("predicted_label")
+    confidence = payload.get("confidence")
+    correct_label = payload.get("correct_label")
+
+    if not all([token, predicted_label, correct_label]) or confidence is None:
+        return jsonify({"error": "Missing fields."}), 400
+    if correct_label not in config.CLASS_NAMES:
+        return jsonify({"error": "Invalid label."}), 400
+
+    tmp_path = os.path.join(TMP_DIR, f"{token}.jpg")
+    if not os.path.exists(tmp_path):
+        return jsonify({"error": "This image has expired -- please analyze it again."}), 410
+
+    image = Image.open(tmp_path)
+    feedback_manager.add_feedback(image, predicted_label, float(confidence), correct_label)
+    os.remove(tmp_path)
+
+    retrain_result = None
+    if feedback_manager.ready_to_retrain():
+        retrain_result = feedback_manager.run_retrain(force=False)
+        if retrain_result.get("accepted"):
             detector.reload()
-            st.success(f"Model updated ✅ ({result['reason']})")
-        else:
-            st.error(f"Update rejected: {result.get('reason')}")
 
-    st.divider()
-    st.caption(
-        "**How learning works:** every confirmed/corrected prediction is queued. "
-        "Once enough pile up, the model is fine-tuned on a *copy* and only "
-        "deployed if it doesn't lose accuracy on a held-out validation set -- "
-        "this stops a single mistaken or malicious label from corrupting the model."
-    )
+    return jsonify({"ok": True, "retrain": retrain_result})
 
-# ---------------------------------------------------------------------------
-# Main: upload + predict
-# ---------------------------------------------------------------------------
-uploaded_file = st.file_uploader("Upload an image (JPG, PNG)", type=["jpg", "jpeg", "png"])
 
-if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    st.image(image, caption="Uploaded image", use_container_width=True)
+@app.route("/api/stats")
+def api_stats():
+    return jsonify(feedback_manager.get_stats())
 
-    with st.spinner("Analyzing..."):
-        result = detector.predict(image)
 
-    label = result["label"]
-    confidence = result["confidence"]
+@app.route("/api/retrain", methods=["POST"])
+def api_retrain():
+    result = feedback_manager.run_retrain(force=True)
+    if result.get("accepted"):
+        detector.reload()
+    return jsonify(result)
 
-    if label == "fake":
-        st.error(f"### 🚨 Likely DEEPFAKE / manipulated — {confidence:.1%} confidence")
-        if confidence >= 0.85:
-            st.markdown(
-                "⚠️ **High-confidence deepfake detection.** If this was shared as "
-                "genuine (e.g. as news, a testimonial, or proof of identity), treat "
-                "it as a strong signal of misinformation or fraud -- verify through "
-                "an independent source before acting on it."
-            )
-    else:
-        st.success(f"### ✅ Likely REAL — {confidence:.1%} confidence")
 
-    if confidence < config.LOW_CONFIDENCE_THRESHOLD:
-        st.info(
-            "🤔 This prediction has relatively low confidence. Your feedback below "
-            "is especially valuable for improving the model on cases like this."
-        )
-
-    st.progress(confidence, text=f"Confidence: {confidence:.1%}")
-    with st.expander("See full probability breakdown"):
-        for cls_name, prob in result["probabilities"].items():
-            st.write(f"**{cls_name.capitalize()}**: {prob:.1%}")
-
-    st.divider()
-    st.subheader("Was this correct?")
-    st.caption(
-        "Your answer is stored to help retrain the model (see sidebar). "
-        "Uploaded images used for feedback are kept locally in `data/feedback/`."
-    )
-
-    col1, col2 = st.columns(2)
-    feedback_given_key = f"feedback_given_{uploaded_file.file_id}"
-
-    if not st.session_state.get(feedback_given_key):
-        with col1:
-            if st.button("✅ Yes, correct", use_container_width=True, key="correct_btn"):
-                feedback_manager.add_feedback(image, label, confidence, correct_label=label)
-                st.session_state[feedback_given_key] = True
-                st.rerun()
-        with col2:
-            if st.button("❌ No, incorrect", use_container_width=True, key="incorrect_btn"):
-                st.session_state[f"show_correction_{uploaded_file.file_id}"] = True
-
-        if st.session_state.get(f"show_correction_{uploaded_file.file_id}"):
-            correct_label = st.radio(
-                "What's the correct label?", options=config.CLASS_NAMES,
-                horizontal=True, key="correction_radio",
-            )
-            if st.button("Submit correction", key="submit_correction_btn"):
-                feedback_manager.add_feedback(image, label, confidence, correct_label=correct_label)
-                st.session_state[feedback_given_key] = True
-                st.rerun()
-    else:
-        st.success("Thanks -- feedback recorded.")
-        if feedback_manager.ready_to_retrain():
-            with st.spinner("Enough feedback collected -- fine-tuning and validating a model update..."):
-                retrain_result = feedback_manager.run_retrain(force=False)
-            if retrain_result.get("accepted"):
-                detector.reload()
-                st.toast("Model updated with new feedback! 🎉", icon="🎉")
-            elif not retrain_result.get("skipped"):
-                st.toast(f"Retrain attempted but rejected: {retrain_result.get('reason')}", icon="⚠️")
-
-# ---------------------------------------------------------------------------
-# Footer / responsible use notice
-# ---------------------------------------------------------------------------
-st.divider()
-with st.expander("ℹ️ Limitations & responsible use"):
-    st.markdown(
-        "- This tool gives a **statistical estimate**, not a certified forensic "
-        "verdict. Treat results as one signal among several, especially for "
-        "high-stakes decisions (fraud claims, content moderation, legal use).\n"
-        "- Accuracy depends entirely on the quality and diversity of the training "
-        "data. A model trained on one deepfake generation method may not catch "
-        "images from newer or different methods.\n"
-        "- False positives (real images flagged as fake) and false negatives "
-        "(fake images flagged as real) are both possible -- always allow for human review.\n"
-        "- Images submitted as feedback are stored locally to improve the model. "
-        "Don't upload images you don't have the right to use for this purpose."
-    )
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", debug=False, port=5000)
