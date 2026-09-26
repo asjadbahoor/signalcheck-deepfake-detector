@@ -90,7 +90,13 @@ class DeepfakeDetector:
         self.eval_transform = get_transforms(train=False)
 
     def _load_or_init(self) -> nn.Module:
-        net = build_backbone(pretrained=True)
+        # Hosted instances may not have enough startup time to download the
+        # optional ImageNet weights. Keep the full pretrained behavior for
+        # local use, while allowing Render to opt out with an environment var.
+        use_pretrained = os.getenv("DEEPFAKE_USE_PRETRAINED", "1").lower() not in {
+            "0", "false", "no"
+        }
+        net = build_backbone(pretrained=use_pretrained)
         if os.path.exists(self.model_path):
             try:
                 checkpoint = torch.load(self.model_path, map_location="cpu")
