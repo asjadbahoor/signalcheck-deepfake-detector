@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+feedback.db
+data/_tmp_uploads/
+data/feedback/*
+!data/feedback/.gitkeep
+models/*.pt
+.DS_Store

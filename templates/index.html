@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signal &mdash; Deepfake &amp; Fraud Image Analysis</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead__mark" aria-hidden="true">
+    <svg viewBox="0 0 32 32" width="28" height="28">
+      <path d="M4 11V5a1 1 0 0 1 1-1h6" fill="none" stroke="currentColor" stroke-width="2"/>
+      <path d="M28 11V5a1 1 0 0 0-1-1h-6" fill="none" stroke="currentColor" stroke-width="2"/>
+      <path d="M4 21v6a1 1 0 0 0 1 1h6" fill="none" stroke="currentColor" stroke-width="2"/>
+      <path d="M28 21v6a1 1 0 0 1-1 1h-6" fill="none" stroke="currentColor" stroke-width="2"/>
+      <circle cx="16" cy="16" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/>
+    </svg>
+  </div>
+  <div class="masthead__text">
+    <h1>Signal</h1>
+    <p>Deepfake &amp; manipulated-image analysis for catching misinformation and fraud before it spreads.</p>
+  </div>
+</header>
+
+<main class="layout">
+
+  <section class="stage" aria-label="Image analysis">
+
+    <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Upload an image to analyze">
+      <input id="file-input" type="file" accept="image/png,image/jpeg" hidden>
+      <svg viewBox="0 0 48 48" width="36" height="36" aria-hidden="true">
+        <path d="M24 32V10M24 10l-8 8M24 10l8 8" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M8 32v6a2 2 0 0 0 2 2h28a2 2 0 0 0 2-2v-6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+      </svg>
+      <p class="dropzone__primary">Drop an image here, or choose a file</p>
+      <p class="dropzone__secondary">JPG or PNG</p>
+    </div>
+
+    <div id="analysis" class="analysis" hidden>
+      <div class="analysis__frame">
+        <img id="preview-img" alt="Uploaded image">
+        <div id="scanline" class="scanline" hidden></div>
+      </div>
+
+      <div class="report" id="report" hidden>
+        <div class="report__verdict" id="verdict">
+          <span class="report__label" id="verdict-label">&mdash;</span>
+          <span class="report__confidence" id="verdict-confidence">&mdash;</span>
+        </div>
+
+        <p class="report__note" id="report-note" hidden></p>
+
+        <div class="probbars" id="probbars"></div>
+
+        <div class="feedback" id="feedback">
+          <p class="feedback__prompt">Was this correct?</p>
+          <div class="feedback__actions" id="feedback-actions">
+            <button class="btn btn--ghost" id="btn-correct" type="button">Yes, correct</button>
+            <button class="btn btn--ghost" id="btn-incorrect" type="button">No, incorrect</button>
+          </div>
+          <div class="feedback__correction" id="feedback-correction" hidden>
+            <p>What's the correct label?</p>
+            <div class="feedback__actions">
+              <button class="btn btn--ghost" data-label="real" type="button">Real</button>
+              <button class="btn btn--ghost" data-label="fake" type="button">Fake</button>
+            </div>
+          </div>
+          <p class="feedback__done" id="feedback-done" hidden>Recorded &mdash; thank you. This helps the model improve.</p>
+        </div>
+      </div>
+
+      <button class="btn btn--text" id="btn-reset" type="button">Analyze another image</button>
+    </div>
+
+    <p class="stage__error" id="stage-error" hidden></p>
+
+  </section>
+
+  <aside class="ledger" aria-label="Model status">
+    <h2>Model ledger</h2>
+
+    <dl class="ledger__stats">
+      <div class="ledger__row">
+        <dt>Feedback collected</dt>
+        <dd id="stat-total">0</dd>
+      </div>
+      <div class="ledger__row">
+        <dt>Corrections received</dt>
+        <dd id="stat-corrections">0</dd>
+      </div>
+    </dl>
+
+    <div class="ledger__progress">
+      <div class="ledger__progress-track">
+        <div class="ledger__progress-fill" id="progress-fill" style="width:0%"></div>
+      </div>
+      <p class="ledger__progress-label" id="progress-label">0 / {{ retrain_threshold }} toward next retrain</p>
+    </div>
+
+    <p class="ledger__last-retrain" id="last-retrain">No retraining has happened yet.</p>
+
+    <button class="btn btn--outline" id="btn-retrain" type="button">Retrain now</button>
+
+    <hr class="ledger__rule">
+
+    <h3>How learning works</h3>
+    <p class="ledger__note">
+      Every confirmed or corrected prediction is queued. Once enough pile up, the
+      model is fine-tuned on a copy and only deployed if it doesn't lose accuracy
+      on a held-out validation set &mdash; this stops a single mistaken or
+      malicious label from corrupting the model.
+    </p>
+  </aside>
+
+</main>
+
+<footer class="notice">
+  <button class="notice__toggle" id="notice-toggle" type="button" aria-expanded="false">
+    Limitations &amp; responsible use
+  </button>
+  <div class="notice__body" id="notice-body" hidden>
+    <p>This tool gives a statistical estimate, not a certified forensic verdict. Treat results as one signal among several, especially for high-stakes decisions such as fraud claims, content moderation, or legal use.</p>
+    <p>A model trained on one deepfake generation method may not catch images made with newer or different methods. Both false positives and false negatives are possible &mdash; keep a human in the loop.</p>
+    <p>Images submitted as feedback are stored locally to improve the model. Don't upload images you don't have the right to use this way.</p>
+  </div>
+</footer>
+
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
